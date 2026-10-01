@@ -1394,33 +1394,63 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithTools(
                                       : "</function>\n</tool_call>");
   const auto calls = static_cast<std::uint32_t>(grammar->rules_.size());
   grammar->rules_.push_back({});
-  // In tool-only mode ordinary text remains unconstrained until a canonical
-  // call marker. The small prefix automaton is carried by the request grammar,
-  // including across tokens, speculative rollback and sampler copies.
+  // In tool-only mode prose remains free until a canonical call marker.
+  // Qwen sometimes emits a bare <invoke name="..."> instead: it is neither
+  // its native envelope nor a parseable API call. Do not let that opener bypass
+  // the constraint as prose. Reasoning and parameter values use separate rules
+  // and may still contain literal examples of either syntax.
+  const std::vector<std::string_view> forbidden =
+      format == ToolFormat::kQwen
+          ? std::vector<std::string_view>{"<invoke ", "<invoke\t", "<invoke\r",
+                                          "<invoke\n", "<invoke>"}
+          : std::vector<std::string_view>{};
+  // Longest-suffix prefix states survive token boundaries, speculative
+  // rollback and sampler copies, just like the canonical marker automaton.
   auto text = [&](std::uint32_t target) {
-    check_capacity(marker.size(), marker.size() * 256, 0);
+    std::vector<std::string_view> prefixes{std::string_view{}};
+    const auto add_prefixes = [&](std::string_view opener) {
+      for (std::size_t length = 1; length < opener.size(); ++length) {
+        const auto prefix = opener.substr(0, length);
+        if (std::ranges::find(prefixes, prefix) == prefixes.end())
+          prefixes.push_back(prefix);
+      }
+    };
+    add_prefixes(marker);
+    for (const auto opener : forbidden)
+      add_prefixes(opener);
+    check_capacity(prefixes.size(), prefixes.size() * 256, 0);
     const auto base = static_cast<std::uint32_t>(grammar->rules_.size());
-    grammar->rules_.resize(base + marker.size());
-    for (std::size_t prefix = 0; prefix < marker.size(); ++prefix) {
+    grammar->rules_.resize(base + prefixes.size());
+    for (std::size_t prefix = 0; prefix < prefixes.size(); ++prefix) {
       grammar->rules_[base + prefix].push_back({});
-      std::vector<std::bitset<256>> transitions(marker.size() + 1);
+      std::vector<std::bitset<256>> transitions(prefixes.size() + 1);
       for (unsigned byte = 0; byte < 256; ++byte) {
-        std::string candidate(marker.substr(0, prefix));
+        std::string candidate(prefixes[prefix]);
         candidate += static_cast<char>(byte);
-        auto matched = std::min(candidate.size(), marker.size());
-        while (matched && !candidate.ends_with(marker.substr(0, matched)))
-          --matched;
+        if (std::ranges::any_of(forbidden, [&](auto opener) {
+              return candidate.ends_with(opener);
+            }))
+          continue;
+        if (candidate.ends_with(marker)) {
+          transitions.back().set(byte);
+          continue;
+        }
+        std::size_t matched = 0;
+        for (std::size_t index = 1; index < prefixes.size(); ++index)
+          if (prefixes[index].size() > prefixes[matched].size() &&
+              candidate.ends_with(prefixes[index]))
+            matched = index;
         transitions[matched].set(byte);
       }
-      for (std::size_t matched = 0; matched <= marker.size(); ++matched) {
+      for (std::size_t matched = 0; matched <= prefixes.size(); ++matched) {
         if (transitions[matched].none() ||
-            (matched == marker.size() && target == UINT32_MAX))
+            (matched == prefixes.size() && target == UINT32_MAX))
           continue;
         const auto terminal = kTerminal | grammar->classes_.size();
         grammar->classes_.push_back(transitions[matched]);
         grammar->rules_[base + prefix].push_back(
             {static_cast<std::uint32_t>(terminal),
-             matched == marker.size()
+             matched == prefixes.size()
                  ? target
                  : base + static_cast<std::uint32_t>(matched)});
       }

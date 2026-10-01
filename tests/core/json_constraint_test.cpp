@@ -839,6 +839,86 @@ void TestAutomaticTools() {
   }
 }
 
+void TestQwenAlternateInvoke() {
+  using Format = JsonConstraint::ToolFormat;
+  const auto schema = parse(R"({"type":"object","properties":{
+    "path":{"type":"string"},"offset":{"type":"integer"},
+    "limit":{"type":"integer"}},"required":["path"],
+    "additionalProperties":false})");
+  const auto parameters =
+      JsonConstraint::ToolParameters(schema, false, Format::kQwen);
+  const std::string path =
+      "/Users/lmtx/dev/agentic_dev_cycle_002/apps/backend/src/server.ts";
+  const std::string call =
+      "<tool_call>\n<function=read>\n<parameter=path>\n" + path +
+      "\n</parameter>\n<parameter=offset>\n1215\n</parameter>\n"
+      "<parameter=limit>\n196\n</parameter>\n</function>\n</tool_call>";
+  for (const bool parallel : {false, true}) {
+    const auto grammar = JsonConstraint::WithTools(
+        nullptr, {{"read", parameters}}, false, parallel, Format::kQwen);
+    const std::string prose = "I will read the SBOM and prepareRun section.\n";
+    assert(Accepts(*grammar, prose));
+    assert(Accepts(*grammar, prose + call));
+    assert(Accepts(*grammar, "<invoked> is not an invoke opener."));
+    for (const auto opener :
+         {"<invoke ", "<invoke\t", "<invoke\n", "<invoke\r", "<invoke>"}) {
+      assert(!Accepts(*grammar, prose + opener + "name=\"read\">"));
+      assert(!Accepts(*grammar, call + "\n" + opener));
+      assert(Accepts(*JsonConstraint::WithReasoning(grammar),
+                     prose + opener + "name=\"read\"></think>" + call));
+      assert(
+          Accepts(*grammar, "<tool_call>\n<function=read>\n<parameter=path>\n" +
+                                std::string(opener) +
+                                "name=\"read\">\n</parameter>\n</function>\n"
+                                "</tool_call>"));
+    }
+    // Bare command text is not enough evidence to infer an executable call.
+    assert(Accepts(*grammar, "read " + path));
+    auto binding = std::make_shared<TokenConstraint>();
+    binding->grammar = grammar;
+    const std::vector<std::string> pieces{"<inv",
+                                          "oke",
+                                          " name=\"read\">",
+                                          ">",
+                                          "oked>",
+                                          "<invoke name=\"read\">",
+                                          "<tool_call>\n<function=read>\n",
+                                          "ordinary",
+                                          "<inv<invoke ",
+                                          "<inv<tool_call>\n<function=read>\n",
+                                          "<parameter=path>\n"};
+    binding->vocabulary = std::make_shared<ConstraintVocabulary>(
+        pieces.size(), [&](std::uint32_t i) {
+          return ConstraintVocabulary::Piece{pieces[i], false};
+        });
+    for (const float temperature : {0.0F, 0.7F}) {
+      SamplerState sampler({.temperature = temperature, .constraint = binding});
+      assert(!binding->Allowed(grammar->Start())->at(5));
+      assert(!binding->Allowed(grammar->Start())->at(8));
+      assert(binding->Allowed(grammar->Start())->at(9));
+      const auto original = sampler;
+      sampler.Accept(0);
+      sampler.Accept(1);
+      assert(sampler.NeedsConstraintMask());
+      std::vector<float> logits(pieces.size(), -INFINITY);
+      logits[2] = logits[3] = 100;  // Attempt the malformed opener.
+      logits[7] = 0;
+      assert(sampler.Sample(logits) == 7);
+      auto copied = sampler;
+      assert(copied.Sample(logits) == 7);
+      sampler = original;  // Speculative rollback clears the partial opener.
+      assert(sampler.CanSelectArgmax(2) == (temperature == 0.0F));
+      sampler.Accept(6);  // Canonical native read call enters its schema.
+      assert(sampler.NeedsConstraintMask());
+    }
+  }
+  // Do not impose Qwen's prose guard on other model dialects.
+  const auto json =
+      JsonConstraint::WithTools(nullptr, {{"read", JsonConstraint::Object()}},
+                                false, true, Format::kJson);
+  assert(Accepts(*json, "<invoke name=\"read\">"));
+}
+
 void TestNativeTools() {
   using Format = JsonConstraint::ToolFormat;
   const auto schema = parse(R"({
@@ -1036,6 +1116,7 @@ int main(int argc, char** argv) {
   TestUnsupportedPatterns();
   TestReasoningConstraint();
   TestAutomaticTools();
+  TestQwenAlternateInvoke();
   TestNativeTools();
   TestOpenNativeTools();
   std::cout << "JSON constraints: language, schema, Unicode and sampler checks "
